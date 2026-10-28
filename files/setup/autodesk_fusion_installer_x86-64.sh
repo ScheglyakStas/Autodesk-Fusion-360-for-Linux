@@ -63,7 +63,7 @@ if [ "$SELECTED_EXTENSIONS" == "--full" ]; then
     DOWNLOAD_EXTENSIONS=1
 fi
 
-REPO_URL="https://raw.githubusercontent.com/designgears/Autodesk-Fusion-360-for-Linux/main"
+REPO_URL="https://raw.githubusercontent.com/ScheglyakStas/Autodesk-Fusion-360-for-Linux/main"
 
 # URL to download translations po. files <-- Still in progress!!!
 UPDATER_TRANSLATIONS_URL="$REPO_URL/files/setup/locale/update-locale.sh"
@@ -86,8 +86,11 @@ declare -A TRANSLATION_URLS=(
 # URL to download winetricks
 WINETRICKS_URL="https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks"
 
-# Prebuilt patched wine and proton
-PREBUILT_URL="https://github.com/designgears/Autodesk-Fusion-360-for-Linux/releases/download/prebuilt-wine-proton-2026.09.12"
+# Prebuilt patched wine and the LD_PRELOAD shim, built by this fork's prebuilt workflow
+PREBUILT_TAG="prebuilt-wine-2026.10.28"
+PREBUILT_URL="https://github.com/ScheglyakStas/Autodesk-Fusion-360-for-Linux/releases/download/$PREBUILT_TAG"
+# This fork doesn't rebuild Proton, it still comes from designgears' release
+PROTON_PREBUILT_URL="https://github.com/designgears/Autodesk-Fusion-360-for-Linux/releases/download/prebuilt-wine-proton-2026.09.12"
 
 # URL to download Fusion360Installer.exe files
 AUTODESK_FUSION_INSTALLER_URL="https://dl.appstreaming.autodesk.com/production/installers/Fusion%20Admin%20Install.exe"
@@ -725,6 +728,7 @@ deactivate_window_not_responding_dialog() {
 create_data_structure() {
     rm -rf "$WINE_PFX"
     mkdir -p "$SELECTED_DIRECTORY/bin" \
+        "$SELECTED_DIRECTORY/lib" \
         "$SELECTED_DIRECTORY/downloads/extensions" \
         "$SELECTED_DIRECTORY/logs" \
         "$SELECTED_DIRECTORY/.desktop" \
@@ -1101,6 +1105,10 @@ PATCH_DAMAGE_FILE="/tmp/wine-present-wait-damage.patch"
 PATCH_DAMAGE_URL="$REPO_URL/files/setup/data/wine-present-wait-damage.patch"
 PATCH_USER32_SD_FILE="/tmp/wine-user32-ignore-desktop-sd.patch"
 PATCH_USER32_SD_URL="$REPO_URL/files/setup/data/wine-user32-ignore-desktop-sd.patch"
+PATCH_XI2_FOCUS_FILE="/tmp/wine-xi2-focus-leak.patch"
+PATCH_XI2_FOCUS_URL="$REPO_URL/files/setup/data/wine-xi2-focus-leak.patch"
+PATCH_SHAPE_FILE="/tmp/wine-shape-follows-size.patch"
+PATCH_SHAPE_URL="$REPO_URL/files/setup/data/wine-shape-follows-size.patch"
 PATCH_MANAGED_PROTON_FILE="/tmp/wine-managed-window-classes-proton.patch"
 PATCH_MANAGED_PROTON_URL="$REPO_URL/files/setup/data/wine-managed-window-classes-proton.patch"
 PATCH_DAMAGE_PROTON_FILE="/tmp/wine-present-wait-damage-proton.patch"
@@ -1128,7 +1136,8 @@ build_patched_wine() {
     WINE_SOURCE_DIR="$HOME/fusion-wine-source"
 
     rm -rf "$WINE_BUILD_DIR"
-    rm -f "$PATCH_POPUPS_FILE" "$PATCH_MANAGED_FILE" "$PATCH_PIPE_FILE" "$PATCH_DAMAGE_FILE" "$PATCH_USER32_SD_FILE"
+    rm -f "$PATCH_POPUPS_FILE" "$PATCH_MANAGED_FILE" "$PATCH_PIPE_FILE" "$PATCH_DAMAGE_FILE" "$PATCH_USER32_SD_FILE" \
+          "$PATCH_XI2_FOCUS_FILE" "$PATCH_SHAPE_FILE"
     echo -e "${YELLOW}Building patched Wine for Fusion 360 window fix (this will take 15-30 minutes)...${NOCOLOR}"
 
     # Download patches
@@ -1146,6 +1155,14 @@ build_patched_wine() {
         exit 1
     }
     curl -L "$PATCH_USER32_SD_URL" -o "$PATCH_USER32_SD_FILE" || {
+        echo -e "${RED}Failed to download Wine patch. Skipping patched build.${NOCOLOR}"
+        exit 1
+    }
+    curl -fL "$PATCH_XI2_FOCUS_URL" -o "$PATCH_XI2_FOCUS_FILE" || {
+        echo -e "${RED}Failed to download Wine patch. Skipping patched build.${NOCOLOR}"
+        exit 1
+    }
+    curl -fL "$PATCH_SHAPE_URL" -o "$PATCH_SHAPE_FILE" || {
         echo -e "${RED}Failed to download Wine patch. Skipping patched build.${NOCOLOR}"
         exit 1
     }
@@ -1180,6 +1197,10 @@ build_patched_wine() {
     apply_source_patch "$PATCH_USER32_SD_FILE" "user32 desktop security patch"
     # Fixes the viewport showing the previous frame
     apply_source_patch "$PATCH_DAMAGE_FILE" "viewport present wait patch"
+    # Backport of wine-11.18's 6aba44f1, stops clicks in other apps / on the lock screen reaching Fusion
+    apply_source_patch "$PATCH_XI2_FOCUS_FILE" "XInput2 focus leak patch"
+    # Fixes dialogs clipped to an old size (command pop-ups, Insert McMaster-Carr Component)
+    apply_source_patch "$PATCH_SHAPE_FILE" "window shape size patch"
 
     # Build and install
     echo -e "${YELLOW}Configuring Wine...${NOCOLOR}"
@@ -1188,6 +1209,8 @@ build_patched_wine() {
     echo -e "${YELLOW}Compiling Wine using $(nproc) cores - this will take a while...${NOCOLOR}"
     make -j$(nproc) || exit 1
     make install || exit 1
+    # Same patch set as the prebuilt release, so --install-fix keeps this build
+    echo "$PREBUILT_TAG" > "$WINE_BUILD_DIR/.prebuilt-tag"
 
     # Cleanup
     cd "$HOME"
@@ -1315,14 +1338,25 @@ download_files() {
     echo -e "$(gettext "${GREEN}Downloading the required files for the installation ...${NOCOLOR}")"
     sleep 2
 
-    if [[ ! -x "$WINE_BUILD_DIR/bin/wine" && "$SELECTED_OPTION" == "--install-fix" ]]; then
-        download_file "fusion-wine-build.tar.gz" "$PREBUILT_URL/fusion-wine-build.tar.gz"
+    # Replace a build from another release too (e.g. designgears' one), it lacks this fork's patches
+    if [[ "$SELECTED_OPTION" == "--install-fix" ]] &&
+       [[ ! -x "$WINE_BUILD_DIR/bin/wine" || "$(cat "$WINE_BUILD_DIR/.prebuilt-tag" 2>/dev/null)" != "$PREBUILT_TAG" ]]; then
+        # The tag is in the file name so a cached tarball from an older release isn't reused
+        download_file "fusion-wine-build-$PREBUILT_TAG.tar.gz" "$PREBUILT_URL/fusion-wine-build.tar.gz"
+        download_file "fusion-wine-build-$PREBUILT_TAG.tar.gz.sha256" "$PREBUILT_URL/fusion-wine-build.tar.gz.sha256"
+        verify_prebuilt_checksum "$SELECTED_DIRECTORY/downloads/fusion-wine-build-$PREBUILT_TAG.tar.gz"
         rm -rf "$WINE_BUILD_DIR"
         echo -e "$(gettext "${YELLOW}Extracting Custom Fusion Wine Build...${NOCOLOR}")"
-        tar -xf "$SELECTED_DIRECTORY/downloads/fusion-wine-build.tar.gz" -C "$HOME"
+        tar -xf "$SELECTED_DIRECTORY/downloads/fusion-wine-build-$PREBUILT_TAG.tar.gz" -C "$HOME"
+        echo "$PREBUILT_TAG" > "$WINE_BUILD_DIR/.prebuilt-tag"
+    fi
+    if [[ "$SELECTED_OPTION" == "--install-fix" ]]; then
+        # Preloaded by the launcher, see files/setup/data/wine_sndbuf_fix.c
+        download_file "wine_sndbuf_fix-$PREBUILT_TAG.so" "$PREBUILT_URL/wine_sndbuf_fix.so"
+        install -m 755 "$SELECTED_DIRECTORY/downloads/wine_sndbuf_fix-$PREBUILT_TAG.so" "$SELECTED_DIRECTORY/lib/wine_sndbuf_fix.so"
     fi
     if [[ ! -x "$PROTON_DIRECTORY/proton" &&"$SELECTED_OPTION" == "--proton" && "$PROTON_VERSION" == "$PROTON_BUILD_NAME" ]]; then
-        download_file "$PROTON_BUILD_NAME.tar.gz" "$PREBUILT_URL/$PROTON_BUILD_NAME.tar.gz"
+        download_file "$PROTON_BUILD_NAME.tar.gz" "$PROTON_PREBUILT_URL/$PROTON_BUILD_NAME.tar.gz"
         rm -rf "$PROTON_DIRECTORY"
         echo -e "$(gettext "${YELLOW}Extracting Custom Proton Build...${NOCOLOR}")"
         tar -xf "$SELECTED_DIRECTORY/downloads/$PROTON_BUILD_NAME.tar.gz" -C "$STEAM_COMPAT_DIR"
@@ -1391,16 +1425,57 @@ download_file() {
 
     if [ -f "$FILE" ]; then
         echo -e "$(gettext "${GREEN}$FILE_NAME exists!${NOCOLOR}")"
-        if find "$FILE" -mtime +7 | grep -q .; then
+        if ! download_file_is_valid "$FILE"; then
+            echo -e "$(gettext "${YELLOW}$FILE_NAME is corrupt or an error page and will be downloaded again!")${NOCOLOR}"
+            rm -f "$FILE"
+        elif find "$FILE" -mtime +7 | grep -q .; then
             echo -e "$(gettext "${YELLOW}$FILE_NAME exists but is older than 7 days and will be updated!")${NOCOLOR}"
-            rm -rf "$FILE"
-            curl -L "$FILE_URL" -o "$FILE"
+            rm -f "$FILE"
         fi
     else
         echo -e "$(gettext "${YELLOW}$FILE_NAME doesn't exist and will be downloaded for you!${NOCOLOR}")"
-        curl -L "$FILE_URL" -o "$FILE"
     fi
-    
+
+    if [ ! -f "$FILE" ]; then
+        # -f: fail on HTTP errors instead of saving the server's error page as the file
+        if ! curl -fL --retry 3 --retry-delay 5 "$FILE_URL" -o "$FILE.part" || ! download_file_is_valid "$FILE.part"; then
+            rm -f "$FILE.part"
+            echo -e "${RED}Failed to download $FILE_NAME from $FILE_URL${NOCOLOR}"
+            echo -e "${RED}If the server returned 'Access Denied', check your VPN/proxy or network region and run the installer again.${NOCOLOR}"
+            exit 1
+        fi
+        mv "$FILE.part" "$FILE"
+    fi
+}
+
+# Windows binaries must start with the "MZ" header; anything else (e.g. an HTML error page) is invalid
+download_file_is_valid() {
+    local FILE="$1"
+    [ -s "$FILE" ] || return 1
+    case "$FILE" in
+        *.exe|*.exe.part|*.dll|*.dll.part|*.msi|*.msi.part)
+            if [[ "$FILE" == *.msi || "$FILE" == *.msi.part ]]; then
+                # MSI files are OLE compound documents
+                [ "$(head -c 4 "$FILE" | od -An -tx1 | tr -d ' \n')" = "d0cf11e0" ]
+            else
+                [ "$(head -c 2 "$FILE")" = "MZ" ]
+            fi
+            ;;
+        *) ! head -c 512 "$FILE" | grep -qi "<html" ;;
+    esac
+}
+
+# Checks a prebuilt tarball against the .sha256 file downloaded next to it
+verify_prebuilt_checksum() {
+    local FILE="$1"
+    local EXPECTED ACTUAL
+    EXPECTED="$(awk '{print $1}' "$FILE.sha256")"
+    ACTUAL="$(sha256sum "$FILE" | awk '{print $1}')"
+    if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+        echo -e "${RED}Checksum mismatch for $(basename "$FILE"), deleting it. Run the installer again.${NOCOLOR}"
+        rm -f "$FILE" "$FILE.sha256"
+        exit 1
+    fi
 }
 
 ##############################################################################################################################################################################

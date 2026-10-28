@@ -1,6 +1,103 @@
 # Autodesk Fusion on Linux
 
-Fork of cryinkfly's [Fusion 360 on Linux](https://codeberg.org/cryinkfly/Autodesk-Fusion-360-on-Linux) installer.
+Fork of [designgears' installer](https://github.com/designgears/Autodesk-Fusion-360-for-Linux) with more fixes for Fusion on the patched Wine 11.17 build. It was tested on Ubuntu 24.04 (GNOME 46, X11, NVIDIA).
+
+## Install
+
+```
+curl -L https://raw.githubusercontent.com/ScheglyakStas/Autodesk-Fusion-360-for-Linux/main/files/setup/autodesk_fusion_installer_x86-64.sh -o "autodesk_fusion_installer_x86-64.sh" && chmod +x autodesk_fusion_installer_x86-64.sh && ./autodesk_fusion_installer_x86-64.sh --install-fix --default
+```
+
+The installer downloads the patched Wine and the `wine_sndbuf_fix.so` shim from [this fork's releases](https://github.com/ScheglyakStas/Autodesk-Fusion-360-for-Linux/releases). An existing `~/fusion-wine-build` from another release, such as designgears' one, is replaced, because it lacks these patches.
+
+To build Wine yourself instead, use `--build wine-fix`. The patches are made for Wine 11.17.
+
+The fixes below are for `--install-fix` only. `--proton=GE-Proton11-Fusion` still uses designgears' Proton build, which has none of them.
+
+## Fixes in this fork
+
+| Problem | Fix |
+|---|---|
+| Install fails with no error | Downloads are checked |
+| Command pop-ups open too small, and "Insert McMaster-Carr Component" doesn't grow when resized | `wine-shape-follows-size.patch` |
+| Clicks in other apps bring Fusion to the front, and the lock screen stops responding | `wine-xi2-focus-leak.patch` |
+| Cloud uploads stuck at about 90 KB/s | `wine_sndbuf_fix.so` |
+| Right-click Marking Menu doesn't appear | `wine_sndbuf_fix.so` |
+| CPU time spent on thread yields | `wine_sndbuf_fix.so` |
+
+### Install fails with no error
+
+**Symptom:** The installer finishes, but Fusion is never installed. `FusionClientInstaller.exe` is only a few hundred bytes and its log is empty.
+
+**Cause:** Autodesk's CDN can answer with an "Access Denied" HTML page, for example depending on VPN or region. `curl -L` saved that page as the `.exe`. The installer also reused any cached download younger than 7 days without checking it.
+
+**Fix** (`download_file` in the installer):
+- Downloads use `curl -fL --retry 3` into a `.part` file.
+- A download is kept only if it is valid: `.exe` and `.dll` files must start with `MZ`, `.msi` files must be OLE compound files, and anything else must not be an HTML page.
+- Invalid cached files are downloaded again.
+- On failure the installer stops with a hint to check VPN and proxy settings, instead of carrying on with a broken file.
+- The prebuilt Wine tarball is also checked against its `.sha256`.
+
+### Command pop-ups too small, McMaster-Carr dialog not resizing
+
+**Symptom:**
+- Command dialogs (Extrude, Fillet, ...) open with their bottom cut off and can't be scrolled. Resizing them by hand, or switching to another app and back, fixes it.
+- "Insert McMaster-Carr Component" relays out its content when resized, but the visible window keeps its old size, so the bottom part can't be reached.
+
+**Cause:** Both are winex11 bugs in keeping the X11 window *shape* (`XShape` bounding region) in sync with the window size. Fusion's Qt dialogs set a Win32 window region (`SetWindowRgn`) on every resize, and winex11 turns that region into the X shape.
+- With client-side graphics, the region is applied only through the window surface's shape mask. Once Fusion's D3D client surface covers the whole dialog, win32u drops the window surface. After that, region updates never reach the X window, and the last mask, sized for the old window, keeps clipping it. This is the McMaster-Carr case.
+- When a dialog grows, Wine sends the new shape before it requests the new size. Mutter (GNOME) clips a client's shape to the size it knows at that moment and doesn't recompute it after the resize. The X window has the right size and shape, but GNOME keeps showing the old height. This is the command pop-up case: Fusion grows those dialogs in steps after creating them.
+
+**Fix** (`files/setup/data/wine-shape-follows-size.patch`, in `dlls/winex11.drv/window.c`):
+- A window without a window surface (`no_surface`) gets its region applied to the X window directly.
+- After the window manager confirms a size change (`ConfigureNotify`), the window's current bounding shape is set again. This makes the window manager re-read the shape at the new size.
+
+### Fusion steals focus, lock screen ignores clicks
+
+**Symptom:**
+- While Fusion runs, clicking another app brings Fusion back to the front.
+- The lock screen can stop responding to clicks, so the only way out is a hard power-off.
+
+**Cause:** Wine 11.17's winex11 turns on XInput2 raw mouse events on the root window while a Wine window has focus, but its `root_window_users` count leaks: a FocusOut for an already destroyed dialog is dropped, and a FocusOut during a grab never turns them off. Raw clicks made anywhere, including on the lock screen, then go to Fusion, which activates itself. In the GNOME journal this shows up as `Buggy client sent a _NET_ACTIVE_WINDOW message with a timestamp of 0`.
+
+**Fix** (`files/setup/data/wine-xi2-focus-leak.patch`): a backport of upstream Wine commit [6aba44f1](https://gitlab.winehq.org/wine/wine/-/commit/6aba44f1), which is in Wine 11.18.
+
+### `wine_sndbuf_fix.so`: uploads, Marking Menu, thread yields
+
+The launcher preloads this shim (`LD_PRELOAD`) when `~/.autodesk_fusion/lib/wine_sndbuf_fix.so` exists. The source is `files/setup/data/wine_sndbuf_fix.c`. It does three things:
+
+- **Slow cloud uploads (about 90 KB/s per connection).**
+  - **Cause:** Wine's `ws2_32` answers `SIO_IDEAL_SEND_BACKLOG_QUERY` with a fixed 64 KB, and the Windows libcurl in Fusion's uploader passes that value to `SO_SNDBUF`. On Linux an explicit `SO_SNDBUF` locks the send buffer at that size, and Wine wakes a blocked writer only about once a second.
+  - **Fix:** inside `wineserver`, `SO_SNDBUF` requests on TCP sockets are raised to 4 MB. The kernel still caps this at `net.core.wmem_max`. Measured with a test upload: about 128 KB/s before, 1.2–1.3 MB/s after.
+- **Right-click Marking Menu doesn't appear.**
+  - **Cause:** designgears' managed-window-classes patch hands Fusion's Qt tool windows to the window manager, and treats layered ones as non-focusable overlays. The Marking Menu is one of them, so GNOME stacks it below the main window.
+  - **Fix:** for the window titled "Marking Menu", the shim changes the class name winex11 sees, so it no longer matches `WINE_X11_MANAGED_CLASSES`. It also maps the window override-redirect, so the menu shows as a normal popup.
+  - To build the shim without this part, use `-DNO_MARKING_MENU_FIX`.
+- **Cheaper `SwitchToThread`.**
+  - **Cause:** Wine wraps every `sched_yield()` in two `getrusage(RUSAGE_THREAD)` calls, and Fusion's oneTBB workers yield thousands of times a second.
+  - **Fix:** those calls from `ntdll.so` now fail fast, and Wine reports a plain success. This saves a few percent of CPU time but brings no visible speed-up.
+
+Build it by hand with:
+
+```
+gcc -O2 -Wall -shared -fPIC -o wine_sndbuf_fix.so files/setup/data/wine_sndbuf_fix.c -ldl
+```
+
+## Notes
+
+- If Fusion feels slow when sketching, these two things made a bigger difference than any Wine change:
+  - Turning the design history off (direct modelling).
+  - Setting the "Qt Rendering Hardware Interface API" preference to D3D11.
+- Enabling the `ntsync` kernel module (`sudo modprobe ntsync`) works with this Wine build, but it made no measurable difference.
+- Starting Fusion from a VS Code terminal crashes it at startup, because VS Code exports `ELECTRON_RUN_AS_NODE=1`. Start it from the app menu, or with `systemd-run --user ~/.autodesk_fusion/bin/autodesk_fusion_launcher.sh`.
+- Running the installer again replaces `~/.autodesk_fusion/bin/autodesk_fusion_launcher.sh` and, if the prebuilt release tag changed, `~/fusion-wine-build`.
+- `.github/workflows/prebuilt.yml` builds a release. Run it from the Actions tab with a new tag, then update `PREBUILT_TAG` in the installer.
+
+---
+
+## designgears' changes
+
+[designgears' fork](https://github.com/designgears/Autodesk-Fusion-360-for-Linux) of cryinkfly's [Fusion 360 on Linux](https://codeberg.org/cryinkfly/Autodesk-Fusion-360-on-Linux) installer, which this fork builds on.
 
 [![Viewport one frame behind, before and after](files/images/fixes/viewport-one-frame-lag.gif)](https://github.com/designgears/Autodesk-Fusion-360-for-Linux/releases/download/prebuilt-wine-proton-2026.09.12/viewport-one-frame-lag-side-by-side.mp4)
 
@@ -16,7 +113,7 @@ Changes:
 - Prebuilt Wine and Proton are downloaded from this repo's releases
 - libXdamage is a required dependency
 
-Install with the patched Wine:
+designgears' install commands (without this fork's fixes):
 
 ```
 curl -L https://raw.githubusercontent.com/designgears/Autodesk-Fusion-360-for-Linux/main/files/setup/autodesk_fusion_installer_x86-64.sh -o "autodesk_fusion_installer_x86-64.sh" && chmod +x autodesk_fusion_installer_x86-64.sh && ./autodesk_fusion_installer_x86-64.sh --install-fix --default

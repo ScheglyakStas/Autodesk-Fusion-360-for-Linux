@@ -38,7 +38,7 @@ fi
 WINE_PFX=$(awk 'NR == 3' "$WINEPREFIX_LOG_FILE")
 PROTON_VERSION=$(awk 'NR == 4' "$WINEPREFIX_LOG_FILE")
 
-REPO_URL="https://raw.githubusercontent.com/designgears/Autodesk-Fusion-360-for-Linux/main"
+REPO_URL="https://raw.githubusercontent.com/ScheglyakStas/Autodesk-Fusion-360-for-Linux/main"
 
 # This feature will check if there is a new version of Autodesk Fusion 360.
 function check_autodesk_fusion_online_versions() {
@@ -104,6 +104,14 @@ export WINE_X11_MANAGED_CLASSES
 # lays out effect constant buffers wrongly and the 3D viewport stops clearing.
 WINEDLLOVERRIDES="d3dcompiler_47,d3dcompiler_43=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 export WINEDLLOVERRIDES
+
+# Preloaded shim (see lib/wine_sndbuf_fix.c): raises Wine's fixed 64 KB TCP send
+# buffer that capped cloud uploads at ~90 KB/s, makes SwitchToThread cheaper, and
+# shows the right-click Marking Menu on top instead of behind the main window.
+SNDBUF_FIX="$AUTODESK_ROOT_DIRECTORY/lib/wine_sndbuf_fix.so"
+if [ -f "$SNDBUF_FIX" ]; then
+    export LD_PRELOAD="$SNDBUF_FIX${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
 
 function run_autodesk_fusion() {
     if [ "$PROTON_VERSION" == "Wine" ]; then
