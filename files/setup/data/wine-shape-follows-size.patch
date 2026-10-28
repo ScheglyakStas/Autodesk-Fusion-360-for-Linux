@@ -1,0 +1,101 @@
+Subject: [PATCH] winex11: keep the X window shape in sync with its size
+
+With client side graphics the window region is only applied through the window
+surface shape mask. Once a client surface (D3D/GL/Vulkan) covers the whole window,
+win32u drops the window surface, so later SetWindowRgn calls never reach the X
+window and the last flushed mask, sized for the old window, keeps clipping it.
+
+The new shape is also usually set before the new size is requested, and mutter
+clips a client shape to the size it knows when the shape changes, so set the
+bounding shape again once the WM has acknowledged a size change.
+
+Fusion dialogs (Qt683QWindowToolSaveBits) hit both when they grow.
+---
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index abf7d67..9772ab6 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -687,6 +687,29 @@ static void sync_empty_window_shape( struct x11drv_win_data *data, struct window
+ #endif
+ }
+ 
++/***********************************************************************
++ *              refresh_window_shape
++ *
++ * Set the bounding shape again after a resize. The shape is usually updated before the
++ * new size is requested, and window managers like mutter clip it to the size they knew
++ * at that time, so the window stays cut to its old size until the next shape change.
++ */
++static void refresh_window_shape( struct x11drv_win_data *data )
++{
++#ifdef HAVE_LIBXSHAPE
++    int bounding_shaped, clip_shaped, x, y;
++    unsigned int width, height;
++
++    if (!data->whole_window) return;
++    if (!XShapeQueryExtents( data->display, data->whole_window, &bounding_shaped, &x, &y, &width, &height,
++                             &clip_shaped, &x, &y, &width, &height ))
++        return;
++    if (bounding_shaped)
++        XShapeCombineShape( data->display, data->whole_window, ShapeBounding, 0, 0,
++                            data->whole_window, ShapeBounding, ShapeSet );
++#endif
++}
++
+ /***********************************************************************
+  *              sync_window_region
+  *
+@@ -698,7 +721,7 @@ static void sync_window_region( struct x11drv_win_data *data, HRGN win_region )
+     HRGN hrgn = win_region;
+ 
+     if (!data->whole_window) return;
+-    if (client_side_graphics) return; /* use surface shape instead */
++    if (client_side_graphics && !data->no_surface) return; /* use surface shape instead */
+     data->shaped = FALSE;
+ 
+     if (hrgn == (HRGN)1)  /* hack: win_region == 1 means retrieve region from server */
+@@ -2059,6 +2082,7 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
+     RECT *desired = &data->desired_state.rect, *pending = &data->pending_state.rect, *current = &data->current_state.rect;
+     unsigned long *expect_serial = &data->configure_serial;
+     const char *expected, *received, *prefix;
++    RECT old_rect = *current;
+ 
+     prefix = wine_dbg_sprintf( "window %p/%lx ", data->hwnd, data->whole_window );
+     received = wine_dbg_sprintf( "config %s/%lu", wine_dbgstr_rect(value), serial );
+@@ -2077,6 +2101,10 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
+         return;
+     data->pending_state.above = FALSE; /* allow requesting it again */
+ 
++    if (data->managed && (current->right - current->left != old_rect.right - old_rect.left ||
++                          current->bottom - current->top != old_rect.bottom - old_rect.top))
++        refresh_window_shape( data );
++
+     /* send any pending changes from the desired state */
+     window_request_desired_state( data );
+ }
+@@ -3420,6 +3448,13 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+                 XShapeOffsetShape( data->display, data->whole_window, ShapeBounding,
+                                    new_x_offset - old_x_offset, new_y_offset - old_y_offset );
+         }
++        /* a window fully covered by a client surface has no window surface anymore, so nothing
++         * flushes its region shape, apply the region directly instead of keeping the stale one */
++        if (data->no_surface != !surface)
++        {
++            data->no_surface = !surface;
++            if (data->no_surface) sync_window_region( data, (HRGN)1 );
++        }
+ #endif
+     }
+ 
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 8c11021..78a7a8f 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -685,6 +685,7 @@ struct x11drv_win_data
+     UINT        managed : 1;    /* is window managed? */
+     UINT        embedded : 1;   /* is window an XEMBED client? */
+     UINT        shaped : 1;     /* is window using a custom region shape? */
++    UINT        no_surface : 1; /* window has no window surface to apply its region shape */
+     UINT        layered : 1;    /* is window layered and with valid attributes? */
+     UINT        use_alpha : 1;  /* does window use an alpha channel? */
+     UINT        skip_taskbar : 1; /* does window should be deleted from taskbar */

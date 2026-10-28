@@ -15,9 +15,9 @@ on:
         type: boolean
         default: true
       build_proton:
-        description: "Build Proton"
+        description: "Build Proton (without this fork's Wine patches, the installer uses designgears' Proton)"
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
@@ -38,8 +38,8 @@ jobs:
         run: |
           gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
             gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "Prebuilt Wine and Proton ($RELEASE_TAG)" \
-              --notes "Patched builds used by the installer."
+              --title "Prebuilt Wine ($RELEASE_TAG)" \
+              --notes "Patched Wine and the LD_PRELOAD shim used by the installer, see the README for the patches."
 
   wine:
     needs: release
@@ -67,7 +67,8 @@ jobs:
       - name: Apply the patches
         working-directory: wine-src
         run: |
-          for p in wine-captionless-popups wine-managed-window-classes wine-user32-ignore-desktop-sd wine-present-wait-damage; do
+          for p in wine-captionless-popups wine-managed-window-classes wine-user32-ignore-desktop-sd wine-present-wait-damage \
+                   wine-xi2-focus-leak wine-shape-follows-size; do
             echo "Applying $p"
             patch -p1 < "$GITHUB_WORKSPACE/files/setup/data/$p.patch"
           done
@@ -79,16 +80,20 @@ jobs:
           make -j"$(nproc)"
           make install
 
+      - name: Build the LD_PRELOAD shim
+        run: gcc -O2 -Wall -shared -fPIC -o wine_sndbuf_fix.so files/setup/data/wine_sndbuf_fix.c -ldl
+
       - name: Upload to the release
         run: |
           tar -C "$HOME" -czf fusion-wine-build.tar.gz fusion-wine-build
           sha256sum fusion-wine-build.tar.gz > fusion-wine-build.tar.gz.sha256
+          sha256sum wine_sndbuf_fix.so > wine_sndbuf_fix.so.sha256
           gh release upload "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --clobber \
-            fusion-wine-build.tar.gz fusion-wine-build.tar.gz.sha256
+            fusion-wine-build.tar.gz fusion-wine-build.tar.gz.sha256 wine_sndbuf_fix.so wine_sndbuf_fix.so.sha256
 
   proton:
     needs: release
-    if: github.event_name == 'push' || inputs.build_proton
+    if: github.event_name == 'workflow_dispatch' && inputs.build_proton
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
